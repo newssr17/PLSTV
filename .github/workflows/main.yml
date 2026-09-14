@@ -1,58 +1,285 @@
 name: Generate playlist automatically
 
+# 每天北京时间 08:00 自动运行，同时保留手动运行。
+
+#
+
+# 注意：
+
+# 1. 本 Workflow 会把最终播放列表提交回当前 GitHub 仓库。
+
+# 2. output/ 在 .gitignore 中被忽略，因此使用 git add -f
+
+# 只强制提交最终结果文件。
+
+# 3. 不提交 output/data、日志、缓存等运行时文件。
+
 on:
-  schedule:
-    # 每天北京时间 08:00 运行（GitHub Actions 使用 UTC）
-    - cron: "0 0 * * *"
-  workflow_dispatch:
+schedule:
+# GitHub Actions 使用 UTC。
+# UTC 00:00 = 北京时间 08:00
+- cron: "0 0 * * *"
+
+workflow_dispatch:
 
 permissions:
-  contents: write
+contents: write
+
+# 防止同一个仓库同时运行两个任务，导致 Git push 冲突。
+
+concurrency:
+group: playlist-git-${{ github.repository }}
+cancel-in-progress: false
 
 jobs:
-  generate:
-    runs-on: ubuntu-latest
+generate:
+name: Generate and commit playlist
+runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+```
+steps:
+  # ------------------------------------------------------------
+  # 1. 获取源代码
+  # ------------------------------------------------------------
+  - name: Checkout source and configuration
+    uses: actions/checkout@v6
+    with:
+      fetch-depth: 1
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-          cache: "pipenv"
+  # ------------------------------------------------------------
+  # 2. 保留原项目对 Guovin 上游配置的支持
+  # ------------------------------------------------------------
+  - name: Load upstream configuration
+    if: github.repository_owner == 'Guovin'
+    run: |
+      git fetch --depth=1 origin gd
+      git archive FETCH_HEAD config | tar -x
 
-      - name: Install Pipenv
-        run: python -m pip install --upgrade pipenv
+  # ------------------------------------------------------------
+  # 3. 记录当前版本和配置状态
+  # ------------------------------------------------------------
+  - name: Record source revision and configuration state
+    id: source
+    env:
+      CONFIG_HASH: ${{ hashFiles('config/**/*.ini', 'config/**/*.txt', 'config/**/*.m3u') }}
+    run: |
+      echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      echo "state_prefix=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-" >> "$GITHUB_OUTPUT"
+      echo "state_key=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        run: pipenv install --dev
+      mkdir -p "$RUNNER_TEMP/iptv-config-before"
 
-      - name: Generate playlist
-        run: pipenv run dev
+      if [[ -d config ]]; then
+        cp -a config/. "$RUNNER_TEMP/iptv-config-before/"
+      fi
 
-      - name: Check generated result
-        run: |
-          test -f output/result.m3u
-          test -f output/result.txt
-          echo "Generated result files:"
-          ls -lh output/result.m3u output/result.txt
+  # ------------------------------------------------------------
+  # 4. 清理仓库中可能存在的运行结果
+  # ------------------------------------------------------------
+  - name: Remove generated files from checkout
+    run: |
+      rm -rf -- output release-assets
 
-      - name: Commit and push result
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+  # ------------------------------------------------------------
+  # 5. 恢复上一次运行的测速历史
+  #
+  # 对 IPTV-API 3.0.0 很重要。
+  # quick mode / 历史测速结果可以从 Actions Cache 恢复，
+  # 避免每天都完全从零开始。
+  # ------------------------------------------------------------
+  - name: Restore result history
+    id: restore-state
+    uses: actions/cache/restore@v4
+    with:
+      path: |
+        output/data/cache.gz
+        output/data/frozen.gz
+      key: ${{ steps.source.outputs.state_key }}
+      restore-keys: ${{ steps.source.outputs.state_prefix }}
 
-          # output/ 被 .gitignore 忽略，只强制提交最终播放列表文件
-          git add -f             output/result.m3u             output/result.txt
+  # ------------------------------------------------------------
+  # 6. Python 3.14
+  # ------------------------------------------------------------
+  - name: Set up Python 3.14
+    uses: actions/setup-python@v6
+    with:
+      python-version: "3.14"
+      update-environment: true
+      cache: pipenv
 
-          if git diff --cached --quiet; then
-            echo "No changes to result files."
-            exit 0
-          fi
+  # ------------------------------------------------------------
+  # 7. 安装 FFmpeg + FFprobe
+  #
+  # IPTV-API 3.0.0 的媒体测速/探测需要 FFmpeg。
+  # ------------------------------------------------------------
+  - name: Install FFmpeg
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y ffmpeg
 
-          git commit -m "chore: update IPTV playlist"
-          git push
+  # ------------------------------------------------------------
+  # 8. 检查 FFmpeg 和 FFprobe
+  #
+  # 如果安装失败，直接停止，不继续跑 1700+ 个接口。
+  # ------------------------------------------------------------
+  - name: Check FFmpeg
+    run: |
+      echo "Checking FFmpeg..."
+      command -v ffmpeg
+      ffmpeg -version | head -n 1
+
+      echo "Checking FFprobe..."
+      command -v ffprobe
+      ffprobe -version | head -n 1
+
+  # ------------------------------------------------------------
+  # 9. 安装 Python 依赖
+  # ------------------------------------------------------------
+  - name: Install dependencies
+    run: |
+      python -m pip install --upgrade pip pipenv
+      pipenv --python 3.14
+      pipenv install --deploy
+
+  # ------------------------------------------------------------
+  # 10. 生成 IPTV 播放列表
+  # ------------------------------------------------------------
+  - name: Generate playlist results
+    run: |
+      pipenv run dev
+
+  # ------------------------------------------------------------
+  # 11. 检查最终结果
+  #
+  # 如果 result.m3u / result.txt 没有生成，
+  # Workflow 直接失败，避免把空结果提交到 Git。
+  # ------------------------------------------------------------
+  - name: Check generated result
+    run: |
+      if [[ ! -f output/result.m3u ]]; then
+        echo "::error::output/result.m3u was not generated."
+        exit 1
+      fi
+
+      if [[ ! -s output/result.m3u ]]; then
+        echo "::error::output/result.m3u is empty."
+        exit 1
+      fi
+
+      if [[ ! -f output/result.txt ]]; then
+        echo "::error::output/result.txt was not generated."
+        exit 1
+      fi
+
+      if [[ ! -s output/result.txt ]]; then
+        echo "::error::output/result.txt is empty."
+        exit 1
+      fi
+
+      echo "Generated playlist:"
+      ls -lh \
+        output/result.m3u \
+        output/result.txt
+
+      echo
+      echo "M3U entries:"
+      grep -c '^#EXTINF' output/result.m3u || true
+
+  # ------------------------------------------------------------
+  # 12. 报告配置变化
+  #
+  # 程序可能自动停用部分订阅源。
+  # 按原项目设计，这些 config 修改不自动提交。
+  # ------------------------------------------------------------
+  - name: Report non-persistent configuration changes
+    run: |
+      if [[ -d "$RUNNER_TEMP/iptv-config-before" ]] && \
+         ! diff -qr "$RUNNER_TEMP/iptv-config-before" config >/dev/null; then
+
+        echo "::warning::The update changed files under config/. These changes are not committed by the workflow."
+
+        {
+          echo "### Configuration notice"
+          echo
+          echo "The update changed files under \`config/\`."
+          echo "These configuration changes are intentionally not committed."
+        } >> "$GITHUB_STEP_SUMMARY"
+      fi
+
+  # ------------------------------------------------------------
+  # 13. 保存本次运行产生的测速历史
+  # ------------------------------------------------------------
+  - name: Detect reusable result state
+    id: result-state
+    run: |
+      if [[ -f output/data/cache.gz || -f output/data/frozen.gz ]]; then
+        echo "available=true" >> "$GITHUB_OUTPUT"
+      fi
+
+  - name: Save result history
+    if: steps.result-state.outputs.available == 'true' && steps.restore-state.outputs.cache-hit != 'true'
+    uses: actions/cache/save@v4
+    with:
+      path: |
+        output/data/cache.gz
+        output/data/frozen.gz
+      key: ${{ steps.source.outputs.state_key }}
+
+  # ------------------------------------------------------------
+  # 14. 提交最终播放列表到 Git
+  #
+  # .gitignore 中有：
+  #
+  #   /output/
+  #
+  # 所以必须使用 git add -f。
+  #
+  # 这里只提交最终结果，不提交：
+  #   output/data/
+  #   output/log/
+  #   其他运行时文件
+  # ------------------------------------------------------------
+  - name: Commit and push playlist
+    env:
+      BRANCH_NAME: ${{ github.ref_name }}
+    run: |
+      git config user.name "github-actions[bot]"
+      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # 强制加入被 .gitignore 忽略的最终播放列表。
+      git add -f \
+        output/result.m3u \
+        output/result.txt
+
+      # 如果结果没有变化，不产生空 commit。
+      if git diff --cached --quiet; then
+        echo "No changes to result files."
+        exit 0
+      fi
+
+      git commit -m "chore: update IPTV playlist"
+
+      # 当前 Workflow 所在分支。
+      git push origin "HEAD:${BRANCH_NAME}"
+
+  # ------------------------------------------------------------
+  # 15. Actions Summary
+  # ------------------------------------------------------------
+  - name: Add result information to summary
+    env:
+      REPOSITORY: ${{ github.repository }}
+      BRANCH_NAME: ${{ github.ref_name }}
+    run: |
+      {
+        echo "### IPTV playlist generated"
+        echo
+        echo "- Branch: \`${BRANCH_NAME}\`"
+        echo "- M3U: \`output/result.m3u\`"
+        echo "- TXT: \`output/result.txt\`"
+        echo
+        echo "The generated playlist was committed to Git."
+        echo
+        echo "Raw M3U:"
+        echo "https://raw.githubusercontent.com/${REPOSITORY}/${BRANCH_NAME}/output/result.m3u"
+      } >> "$GITHUB_STEP_SUMMARY"
+```
