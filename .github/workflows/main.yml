@@ -86,11 +86,6 @@ jobs:
           pipenv --python 3.14
           pipenv install --deploy
 
-      - name: Check subscription sources concurrently
-        run: |
-          pipenv run python scripts/check_source_urls.py \
-            --file config/subscribe.txt \
-            --concurrency 24
 
       - name: Check subscription sources (async, read-only)
         env:
