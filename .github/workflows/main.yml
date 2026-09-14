@@ -1,8 +1,8 @@
 name: Generate IPTV playlist
 
 on:
+  # GitHub Actions cron uses UTC. 00:00 UTC = 08:00 Asia/Shanghai.
   schedule:
-    # 每天北京时间 08:00（GitHub Actions 使用 UTC）
     - cron: "0 0 * * *"
   workflow_dispatch:
 
@@ -16,30 +16,61 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout source and configuration
+        uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+
+      # Keep the upstream project's special Guovin/gd behavior unchanged.
+      - name: Load upstream configuration
+        if: github.repository_owner == 'Guovin'
+        run: |
+          git fetch --depth=1 origin gd
+          git archive FETCH_HEAD config | tar -x
+
+      - name: Record source revision and cache key
+        id: source
+        env:
+          CONFIG_HASH: ${{ hashFiles('config/**/*.ini', 'config/**/*.txt', 'config/**/*.m3u') }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "state_prefix=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-" >> "$GITHUB_OUTPUT"
+          echo "state_key=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "$RUNNER_TEMP/iptv-config-before"
+          cp -a config/. "$RUNNER_TEMP/iptv-config-before/"
+
+      # Generated output is intentionally not restored from Git.
+      - name: Remove generated output
+        run: rm -rf -- output release-assets
+
+      # Preserve the project's historical cache/frozen state between runs.
+      - name: Restore result history
+        id: restore-state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            output/data/cache.gz
+            output/data/frozen.gz
+          key: ${{ steps.source.outputs.state_key }}
+          restore-keys: ${{ steps.source.outputs.state_prefix }}
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+          update-environment: true
           cache: pipenv
-
-      - name: Install Pipenv and dependencies
-        run: |
-          python -m pip install --upgrade pip pipenv
-          pipenv install --dev
 
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Check FFmpeg
+      - name: Verify FFmpeg
         run: |
           echo "FFmpeg:"
           command -v ffmpeg
@@ -48,43 +79,207 @@ jobs:
           command -v ffprobe
           ffprobe -version | head -n 1
 
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip pipenv
+          pipenv --python 3.14
+          pipenv install --deploy
+
       - name: Generate playlist
+        env:
+          # Used by the project's public URL / release integration when applicable.
+          IPTV_API_ARTIFACT_BASE_URL: https://github.com/${{ github.repository }}/releases/download/playlist-latest
         run: pipenv run dev
 
-      - name: Check generated user result
+      - name: Resolve and validate configured result
+        id: result
+        shell: bash
         run: |
-          echo "Checking configured result files..."
+          set -euo pipefail
 
-          test -s output/user_result.txt || {
-            echo "::error::output/user_result.txt was not generated or is empty."
-            echo "Files currently under output/:"
-            find output -maxdepth 4 -type f -printf '%p (%s bytes)\n' | sort || true
-            exit 1
-          }
+          FINAL_FILE="$(pipenv run python -c 'from utils.config import config; print(config.final_file)')"
+          M3U_ENABLED="$(pipenv run python -c 'from utils.config import config; print(str(config.open_m3u_result).lower())')"
 
-          test -s output/user_result.m3u || {
-            echo "::error::output/user_result.m3u was not generated or is empty."
-            echo "The configuration requires open_m3u_result = True."
-            echo "Files currently under output/:"
-            find output -maxdepth 4 -type f -printf '%p (%s bytes)\n' | sort || true
+          FINAL_PATH="$(python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); print(p if p.is_absolute() else Path.cwd()/p)' "$FINAL_FILE")"
+          M3U_PATH="${FINAL_PATH%.*}.m3u"
+
+          echo "Configured final_file: $FINAL_FILE"
+          echo "Resolved TXT: $FINAL_PATH"
+          echo "Resolved M3U: $M3U_PATH"
+          echo "open_m3u_result: $M3U_ENABLED"
+
+          if [[ ! -s "$FINAL_PATH" ]]; then
+            echo "::error::Configured TXT result was not generated or is empty: $FINAL_PATH"
+            echo "Actual output files:"
+            find output -maxdepth 5 -type f -printf '%p (%s bytes)\n' | sort || true
             exit 1
-          }
+          fi
+
+          if [[ "$M3U_ENABLED" == "true" && ! -s "$M3U_PATH" ]]; then
+            echo "::error::M3U result was not generated or is empty: $M3U_PATH"
+            echo "open_m3u_result is enabled, so the corresponding M3U file is required."
+            echo "Actual output files:"
+            find output -maxdepth 5 -type f -printf '%p (%s bytes)\n' | sort || true
+            exit 1
+          fi
+
+          echo "final_file=$FINAL_PATH" >> "$GITHUB_OUTPUT"
+          echo "m3u_file=$M3U_PATH" >> "$GITHUB_OUTPUT"
+          echo "m3u_enabled=$M3U_ENABLED" >> "$GITHUB_OUTPUT"
 
           echo "Generated result files:"
-          ls -lh output/user_result.txt output/user_result.m3u
+          ls -lh "$FINAL_PATH"
+          if [[ "$M3U_ENABLED" == "true" ]]; then
+            ls -lh "$M3U_PATH"
+          fi
 
-      - name: Commit user_result files
+      # Keep the original project's rolling release publishing feature.
+      - name: Prepare public release assets
+        id: assets
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
+          set -euo pipefail
+
+          FINAL_FILE="${{ steps.result.outputs.final_file }}"
+          pipenv run python scripts/publish_results.py \
+            --final-file "$FINAL_FILE" \
+            --destination release-assets
+
+          echo "Release assets:"
+          find release-assets -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
+
+      - name: Report configuration changes
+        run: |
+          if ! diff -qr "$RUNNER_TEMP/iptv-config-before" config >/dev/null; then
+            echo "::warning::The update changed files under config/. These changes are not committed by this workflow."
+            {
+              echo "### Configuration notice"
+              echo
+              echo "The update changed files under \`config/\`."
+              echo "Configuration changes are intentionally not committed by the workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish rolling playlist release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: playlist-latest
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" \
+              --title "Latest generated playlist" \
+              --notes "Rolling, automatically generated IPTV results. Assets are replaced by each successful run." \
+              --prerelease
+          fi
+
+          mapfile -d '' local_assets < <(
+            find release-assets -maxdepth 1 -type f -print0 | sort -z
+          )
+
+          if (( ${#local_assets[@]} == 0 )); then
+            echo "::error::No release assets were prepared."
+            exit 1
+          fi
+
+          gh release upload "$RELEASE_TAG" "${local_assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          mapfile -t remote_assets < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+
+          for asset in "${remote_assets[@]}"; do
+            if [[ ! -f "release-assets/$asset" ]]; then
+              gh release delete-asset "$RELEASE_TAG" "$asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            fi
+          done
+
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/local-assets.txt
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' | sort > /tmp/remote-assets.txt
+
+          diff -u /tmp/local-assets.txt /tmp/remote-assets.txt
+
+      - name: Check source Git revision
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      # The original project stores reusable historical state outside Git.
+      - name: Detect reusable result state
+        id: result-state
+        run: |
+          if [[ -f output/data/cache.gz || -f output/data/frozen.gz ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save result history
+        if: steps.result-state.outputs.available == 'true' && steps.restore-state.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            output/data/cache.gz
+            output/data/frozen.gz
+          key: ${{ steps.source.outputs.state_key }}
+
+      # New requirement: commit only the generated user result files.
+      # Do not use "git add *", because output/ is intentionally ignored.
+      - name: Commit generated playlist to Git
+        env:
+          FINAL_FILE: ${{ steps.result.outputs.final_file }}
+          M3U_FILE: ${{ steps.result.outputs.m3u_file }}
+          M3U_ENABLED: ${{ steps.result.outputs.m3u_enabled }}
+        run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # output/ is ignored by .gitignore, so force-add these two files.
-          git add -f output/user_result.txt output/user_result.m3u
+          git add -f "$FINAL_FILE"
+
+          if [[ "$M3U_ENABLED" == "true" ]]; then
+            git add -f "$M3U_FILE"
+          fi
 
           if git diff --cached --quiet; then
-            echo "No changes to user_result.txt/user_result.m3u."
+            echo "No changes to generated playlist files."
             exit 0
           fi
 
           git commit -m "chore: update IPTV playlist"
           git push
+
+      - name: Add run summary
+        env:
+          RELEASE_BASE: https://github.com/${{ github.repository }}/releases/download/playlist-latest
+          FINAL_FILE: ${{ steps.result.outputs.final_file }}
+          M3U_FILE: ${{ steps.result.outputs.m3u_file }}
+          M3U_ENABLED: ${{ steps.result.outputs.m3u_enabled }}
+        run: |
+          {
+            echo "### IPTV playlist generation"
+            echo
+            echo "- TXT: \`$FINAL_FILE\`"
+            if [[ "$M3U_ENABLED" == "true" ]]; then
+              echo "- M3U: \`$M3U_FILE\`"
+            fi
+            echo "- Release: $RELEASE_BASE"
+            echo "- Schedule: 08:00 Asia/Shanghai"
+          } >> "$GITHUB_STEP_SUMMARY"
