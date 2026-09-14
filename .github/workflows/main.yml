@@ -260,14 +260,13 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -f "$FINAL_FILE"
-          git add config/subscribe.txt
 
           if [[ "$M3U_ENABLED" == "true" ]]; then
             git add -f "$M3U_FILE"
           fi
 
           if git diff --cached --quiet; then
-            echo "No changes to generated playlist or subscription-source files."
+            echo "No changes to generated playlist files."
             exit 0
           fi
 
