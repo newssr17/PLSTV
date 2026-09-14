@@ -1,9 +1,10 @@
 name: Generate IPTV playlist
 
 on:
-  # GitHub Actions cron uses UTC. 00:00 UTC = 08:00 Asia/Shanghai.
+  # GitHub Actions cron uses UTC. 18:00 UTC = 02:00 Asia/Shanghai on the next day.
+  # Runs every Tuesday and Friday at 02:00 Asia/Shanghai.
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 18 * * 1,4"
   workflow_dispatch:
 
 permissions:
@@ -85,6 +86,12 @@ jobs:
           pipenv --python 3.14
           pipenv install --deploy
 
+      - name: Check subscription sources concurrently
+        run: |
+          pipenv run python scripts/check_source_urls.py \
+            --file config/subscribe.txt \
+            --concurrency 24
+
       - name: Generate playlist
         env:
           # Used by the project's public URL / release integration when applicable.
@@ -157,7 +164,7 @@ jobs:
               echo "### Configuration notice"
               echo
               echo "The update changed files under \`config/\`."
-              echo "Configuration changes are intentionally not committed by the workflow."
+              echo "Subscription-source changes are committed; other configuration changes are not."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -253,18 +260,48 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add -f "$FINAL_FILE"
+          git add config/subscribe.txt
 
           if [[ "$M3U_ENABLED" == "true" ]]; then
             git add -f "$M3U_FILE"
           fi
 
           if git diff --cached --quiet; then
-            echo "No changes to generated playlist files."
+            echo "No changes to generated playlist or subscription-source files."
             exit 0
           fi
 
           git commit -m "chore: update IPTV playlist"
-          git push
+
+          # The remote branch may have advanced since checkout (for example,
+          # a previous Actions run or a manual commit). Rebase the generated
+          # result commit onto the latest remote before pushing.
+          # Retry a few times in case another run pushes at the same time.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:${GITHUB_REF_NAME}; then
+              echo "Generated playlist pushed successfully."
+              exit 0
+            fi
+
+            echo "Push rejected; synchronizing with origin/${GITHUB_REF_NAME} (attempt ${attempt}/3)."
+            git fetch origin "${GITHUB_REF_NAME}"
+
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              echo "Rebase conflict detected in generated result files; keeping this run's generated results."
+              git checkout --theirs -- "$FINAL_FILE"
+              if [[ "$M3U_ENABLED" == "true" ]]; then
+                git checkout --theirs -- "$M3U_FILE"
+              fi
+              git add -f "$FINAL_FILE"
+              if [[ "$M3U_ENABLED" == "true" ]]; then
+                git add -f "$M3U_FILE"
+              fi
+              GIT_EDITOR=true git rebase --continue
+            fi
+          done
+
+          echo "::error::Unable to push generated playlist after 3 attempts."
+          exit 1
 
       - name: Add run summary
         env:
@@ -281,5 +318,5 @@ jobs:
               echo "- M3U: \`$M3U_FILE\`"
             fi
             echo "- Release: $RELEASE_BASE"
-            echo "- Schedule: 08:00 Asia/Shanghai"
+            echo "- Schedule: every Tuesday and Friday at 02:00 Asia/Shanghai"
           } >> "$GITHUB_STEP_SUMMARY"
