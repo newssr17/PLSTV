@@ -1,271 +1,384 @@
 name: Generate IPTV playlist
 
 on:
-  workflow_dispatch:
-
+  # GitHub Actions cron uses UTC. 18:00 UTC = 02:00 Asia/Shanghai on the next day.
+  # Runs every Tuesday and Friday at 02:00 Asia/Shanghai.
   schedule:
-    - cron: "0 */12 * * *"
+    - cron: "0 18 * * 1,4"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: iptv-${{ github.repository }}
-  cancel-in-progress: true
-
-env:
-  PYTHON_VERSION: "3.12"
-  RELEASE_TAG: playlist-latest
+  group: iptv-playlist-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
-
-  prepare:
-
+  generate:
     runs-on: ubuntu-latest
-
-    outputs:
-      cache_key: ${{ steps.cache.outputs.cache_key }}
+    timeout-minutes: 90
 
     steps:
-
-      - name: Checkout
+      - name: Checkout source and configuration
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Generate Cache Key
-        id: cache
-        shell: bash
+      # Keep the upstream project's special Guovin/gd behavior unchanged.
+      - name: Load upstream configuration
+        if: github.repository_owner == 'Guovin'
         run: |
-          set -Eeuo pipefail
+          git fetch --depth=1 origin gd
+          git archive FETCH_HEAD config | tar -x
 
-          echo "cache_key=iptv-${{ hashFiles('config/**/*.ini', 'config/**/*.txt', 'config/**/*.m3u') }}" \
-            >> "$GITHUB_OUTPUT"
+      - name: Record source revision and cache key
+        id: source
+        env:
+          CONFIG_HASH: ${{ hashFiles('config/**/*.ini', 'config/**/*.txt', 'config/**/*.m3u') }}
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "state_prefix=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-" >> "$GITHUB_OUTPUT"
+          echo "state_key=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
 
-  build:
+          mkdir -p "$RUNNER_TEMP/iptv-config-before"
+          cp -a config/. "$RUNNER_TEMP/iptv-config-before/"
 
-    needs: prepare
+      # Generated output is intentionally not restored from Git.
+      - name: Remove generated output
+        run: rm -rf -- output release-assets
 
-    strategy:
-      fail-fast: false
-
-      matrix:
-        group:
-          - china
-          - hk_tw
-          - global
-
-    runs-on: ubuntu-latest
-
-    timeout-minutes: 60
-
-    steps:
-
-      - name: Checkout
-        uses: actions/checkout@v6
+      # Preserve the project's historical cache/frozen state between runs.
+      - name: Restore result history
+        id: restore-state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            output/data/cache.gz
+            output/data/frozen.gz
+          key: ${{ steps.source.outputs.state_key }}
+          restore-keys: ${{ steps.source.outputs.state_prefix }}
 
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Cache Pipenv
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/.local/share/virtualenvs
-          key: pipenv-${{ runner.os }}-${{ hashFiles('Pipfile.lock') }}
-
-      - name: Restore IPTV State
-        uses: actions/cache@v4
-        with:
-          path: output/data
-          key: state-${{ needs.prepare.outputs.cache_key }}
+          python-version: "3.14"
+          update-environment: true
+          cache: pipenv
 
       - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Verify FFmpeg
+        run: |
+          echo "FFmpeg:"
+          command -v ffmpeg
+          ffmpeg -version | head -n 1
+          echo "FFprobe:"
+          command -v ffprobe
+          ffprobe -version | head -n 1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip pipenv
+          pipenv --python 3.14
+          pipenv install --deploy
+
+
+      - name: Check subscription sources (async, read-only)
+        env:
+          SOURCE_CONCURRENCY: "24"
+          SOURCE_CONNECT_TIMEOUT: "3"
+          SOURCE_TOTAL_TIMEOUT: "6"
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio
+          import urllib.request
+          from pathlib import Path
+
+          path = Path("config/subscribe.txt")
+          urls = []
+          seen = set()
+
+          for raw in path.read_text(encoding="utf-8").splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if not (line.startswith("http://") or line.startswith("https://")):
+                  continue
+              if line not in seen:
+                  seen.add(line)
+                  urls.append(line)
+
+          async def check(url):
+              try:
+                  timeout = 6
+                  # urllib is executed in a bounded thread pool so this step remains
+                  # compatible with the project's existing Python environment.
+                  def fetch():
+                      req = urllib.request.Request(
+                          url,
+                          headers={"User-Agent": "Mozilla/5.0 IPTV-Source-Check"},
+                          method="GET",
+                      )
+                      with urllib.request.urlopen(req, timeout=timeout) as r:
+                          data = r.read(4096)
+                          return r.status, len(data)
+                  status, size = await asyncio.wait_for(
+                      asyncio.to_thread(fetch), timeout=timeout
+                  )
+                  return url, status, size, None
+              except Exception as exc:
+                  return url, None, 0, str(exc)
+
+          async def main():
+              sem = asyncio.Semaphore(24)
+
+              async def bounded(url):
+                  async with sem:
+                      return await check(url)
+
+              results = await asyncio.gather(*(bounded(u) for u in urls))
+              ok = 0
+              for url, status, size, error in results:
+                  if status and size > 0:
+                      ok += 1
+                      print(f"OK [{status}, {size} bytes] {url}")
+                  else:
+                      print(f"UNAVAILABLE [{error or 'empty response'}] {url}")
+              print(f"Checked: {len(urls)} | reachable: {ok} | unavailable: {len(urls)-ok}")
+              print("Read-only check: config/subscribe.txt was NOT modified.")
+
+          asyncio.run(main())
+          PY
+
+      - name: Generate playlist
+        env:
+          # Used by the project's public URL / release integration when applicable.
+          IPTV_API_ARTIFACT_BASE_URL: https://github.com/${{ github.repository }}/releases/download/playlist-latest
+        run: pipenv run dev
+
+      - name: Resolve and validate configured result
+        id: result
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          FINAL_FILE="$(pipenv run python -c 'from utils.config import config; print(config.final_file)')"
+          M3U_ENABLED="$(pipenv run python -c 'from utils.config import config; print(str(config.open_m3u_result).lower())')"
 
-      - name: Install Dependencies
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          FINAL_PATH="$(python -c 'from pathlib import Path; import sys; p=Path(sys.argv[1]); print(p if p.is_absolute() else Path.cwd()/p)' "$FINAL_FILE")"
+          M3U_PATH="${FINAL_PATH%.*}.m3u"
 
-          python -m pip install -U pip
-          python -m pip install pipenv
+          echo "Configured final_file: $FINAL_FILE"
+          echo "Resolved TXT: $FINAL_PATH"
+          echo "Resolved M3U: $M3U_PATH"
+          echo "open_m3u_result: $M3U_ENABLED"
 
-          if [ -f Pipfile.lock ]; then
-            pipenv sync
-          else
-            pipenv install --deploy
+          if [[ ! -s "$FINAL_PATH" ]]; then
+            echo "::error::Configured TXT result was not generated or is empty: $FINAL_PATH"
+            echo "Actual output files:"
+            find output -maxdepth 5 -type f -printf '%p (%s bytes)\n' | sort || true
+            exit 1
           fi
 
-      - name: Generate Playlist
-        shell: bash
+          if [[ "$M3U_ENABLED" == "true" && ! -s "$M3U_PATH" ]]; then
+            echo "::error::M3U result was not generated or is empty: $M3U_PATH"
+            echo "open_m3u_result is enabled, so the corresponding M3U file is required."
+            echo "Actual output files:"
+            find output -maxdepth 5 -type f -printf '%p (%s bytes)\n' | sort || true
+            exit 1
+          fi
+
+          echo "final_file=$FINAL_PATH" >> "$GITHUB_OUTPUT"
+          echo "m3u_file=$M3U_PATH" >> "$GITHUB_OUTPUT"
+          echo "m3u_enabled=$M3U_ENABLED" >> "$GITHUB_OUTPUT"
+
+          echo "Generated result files:"
+          ls -lh "$FINAL_PATH"
+          if [[ "$M3U_ENABLED" == "true" ]]; then
+            ls -lh "$M3U_PATH"
+          fi
+
+      # Keep the original project's rolling release publishing feature.
+      - name: Prepare public release assets
+        id: assets
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          pipenv run python scripts/build.py \
-            --group "${{ matrix.group }}"
+          FINAL_FILE="${{ steps.result.outputs.final_file }}"
+          pipenv run python scripts/publish_results.py \
+            --final-file "$FINAL_FILE" \
+            --destination release-assets
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: playlist-${{ matrix.group }}
-          path: output
+          echo "Release assets:"
+          find release-assets -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
 
-  merge:
-
-    needs: build
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - uses: actions/checkout@v6
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Merge Playlists
-        shell: bash
+      - name: Report configuration changes
         run: |
-          set -Eeuo pipefail
+          if ! diff -qr "$RUNNER_TEMP/iptv-config-before" config >/dev/null; then
+            echo "::warning::The update changed files under config/. These changes are not committed by this workflow."
+            {
+              echo "### Configuration notice"
+              echo
+              echo "The update changed files under \`config/\`."
+              echo "Subscription-source changes are committed; other configuration changes are not."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-          mkdir -p final
-
-          find artifacts -name "*.txt" \
-            -exec cat {} \; \
-            | sort -u \
-            > final/iptv.txt
-
-          find artifacts -name "*.m3u" \
-            -exec cat {} \; \
-            | sort -u \
-            > final/iptv.m3u
-
-      - name: Validate Output
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          test -s final/iptv.txt
-          test -s final/iptv.m3u
-
-          wc -l final/iptv.txt
-          wc -l final/iptv.m3u
-
-      - name: Upload Final Playlist
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-playlist
-          path: final
-
-  release:
-
-    needs: merge
-
-    runs-on: ubuntu-latest
-
-    steps:
-
-      - uses: actions/checkout@v6
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: final-playlist
-          path: release-assets
-
-      - name: Create Release
+      - name: Publish rolling playlist release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+          RELEASE_TAG: playlist-latest
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
 
-          gh release view "${RELEASE_TAG}" \
-          >/dev/null 2>&1 || \
-          gh release create "${RELEASE_TAG}" \
-            --title "Latest IPTV Playlist" \
-            --notes "Automatically generated IPTV playlist." \
-            --prerelease
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" \
+              --title "Latest generated playlist" \
+              --notes "Rolling, automatically generated IPTV results. Assets are replaced by each successful run." \
+              --prerelease
+          fi
 
-      - name: Upload Release Assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          mapfile -d '' local_assets < <(
+            find release-assets -maxdepth 1 -type f -print0 | sort -z
+          )
 
-          gh release upload \
-            "${RELEASE_TAG}" \
-            release-assets/* \
+          if (( ${#local_assets[@]} == 0 )); then
+            echo "::error::No release assets were prepared."
+            exit 1
+          fi
+
+          gh release upload "$RELEASE_TAG" "${local_assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --clobber
 
-  commit:
+          mapfile -t remote_assets < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )
 
-    needs: release
+          for asset in "${remote_assets[@]}"; do
+            if [[ ! -f "release-assets/$asset" ]]; then
+              gh release delete-asset "$RELEASE_TAG" "$asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            fi
+          done
 
-    runs-on: ubuntu-latest
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/local-assets.txt
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' | sort > /tmp/remote-assets.txt
 
-    steps:
+          diff -u /tmp/local-assets.txt /tmp/remote-assets.txt
 
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: final-playlist
-          path: output
-
-      - name: Commit Playlist
-        shell: bash
+      - name: Check source Git revision
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
-          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      # The original project stores reusable historical state outside Git.
+      - name: Detect reusable result state
+        id: result-state
+        run: |
+          if [[ -f output/data/cache.gz || -f output/data/frozen.gz ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save result history
+        if: steps.result-state.outputs.available == 'true' && steps.restore-state.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            output/data/cache.gz
+            output/data/frozen.gz
+          key: ${{ steps.source.outputs.state_key }}
+
+      # New requirement: commit only the generated user result files.
+      # Do not use "git add *", because output/ is intentionally ignored.
+      - name: Commit generated playlist to Git
+        env:
+          FINAL_FILE: ${{ steps.result.outputs.final_file }}
+          M3U_FILE: ${{ steps.result.outputs.m3u_file }}
+          M3U_ENABLED: ${{ steps.result.outputs.m3u_enabled }}
+        run: |
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email \
-          "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -f output/*
+          git add -f "$FINAL_FILE"
+
+          if [[ "$M3U_ENABLED" == "true" ]]; then
+            git add -f "$M3U_FILE"
+          fi
 
           if git diff --cached --quiet; then
-            echo "No changes"
+            echo "No changes to generated playlist files."
             exit 0
           fi
 
-          git commit -m \
-          "chore: update IPTV playlist"
+          git commit -m "chore: update IPTV playlist"
 
-          git fetch origin
+          # The remote branch may have advanced since checkout (for example,
+          # a previous Actions run or a manual commit). Rebase the generated
+          # result commit onto the latest remote before pushing.
+          # Retry a few times in case another run pushes at the same time.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:${GITHUB_REF_NAME}; then
+              echo "Generated playlist pushed successfully."
+              exit 0
+            fi
 
-          git rebase origin/${GITHUB_REF_NAME} || {
-            git rebase --abort
-            git reset --hard origin/${GITHUB_REF_NAME}
-          }
+            echo "Push rejected; synchronizing with origin/${GITHUB_REF_NAME} (attempt ${attempt}/3)."
+            git fetch origin "${GITHUB_REF_NAME}"
 
-          git push
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              echo "Rebase conflict detected in generated result files; keeping this run's generated results."
+              git checkout --theirs -- "$FINAL_FILE"
+              if [[ "$M3U_ENABLED" == "true" ]]; then
+                git checkout --theirs -- "$M3U_FILE"
+              fi
+              git add -f "$FINAL_FILE"
+              if [[ "$M3U_ENABLED" == "true" ]]; then
+                git add -f "$M3U_FILE"
+              fi
+              GIT_EDITOR=true git rebase --continue
+            fi
+          done
 
-  cleanup:
+          echo "::error::Unable to push generated playlist after 3 attempts."
+          exit 1
 
-    needs: release
-
-    runs-on: ubuntu-latest
-
-    if: always()
-
-    steps:
-
-      - name: Cleanup Temp Files
+      - name: Add run summary
+        env:
+          RELEASE_BASE: https://github.com/${{ github.repository }}/releases/download/playlist-latest
+          FINAL_FILE: ${{ steps.result.outputs.final_file }}
+          M3U_FILE: ${{ steps.result.outputs.m3u_file }}
+          M3U_ENABLED: ${{ steps.result.outputs.m3u_enabled }}
         run: |
-          rm -rf artifacts || true
-          rm -rf release-assets || true
+          {
+            echo "### IPTV playlist generation"
+            echo
+            echo "- TXT: \`$FINAL_FILE\`"
+            if [[ "$M3U_ENABLED" == "true" ]]; then
+              echo "- M3U: \`$M3U_FILE\`"
+            fi
+            echo "- Release: $RELEASE_BASE"
+            echo "- Schedule: every Tuesday and Friday at 02:00 Asia/Shanghai"
+          } >> "$GITHUB_STEP_SUMMARY"
