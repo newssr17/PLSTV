@@ -2,7 +2,7 @@ name: Generate playlist automatically
 
 on:
   schedule:
-    # 每天北京时间 08:00 运行（UTC 00:00）
+    # 每天北京时间 08:00 运行（GitHub Actions 使用 UTC）
     - cron: "0 0 * * *"
   workflow_dispatch:
 
@@ -38,7 +38,7 @@ jobs:
         run: |
           test -f output/result.m3u
           test -f output/result.txt
-          echo "Generated:"
+          echo "Generated result files:"
           ls -lh output/result.m3u output/result.txt
 
       - name: Commit and push result
@@ -46,7 +46,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add output/result.m3u output/result.txt
+          # output/ 被 .gitignore 忽略，只强制提交最终播放列表文件
+          git add -f             output/result.m3u             output/result.txt
 
           if git diff --cached --quiet; then
             echo "No changes to result files."
