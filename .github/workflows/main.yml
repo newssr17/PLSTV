@@ -1,8 +1,8 @@
-name: Generate playlist automatically
+name: Generate IPTV playlist
 
 on:
   schedule:
-    # 每天北京时间 08:00 运行（GitHub Actions 使用 UTC）
+    # 每天北京时间 08:00（GitHub Actions 使用 UTC）
     - cron: "0 0 * * *"
   workflow_dispatch:
 
@@ -10,54 +10,29 @@ permissions:
   contents: write
 
 concurrency:
-  group: playlist-generation-${{ github.repository }}
+  group: iptv-playlist-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   generate:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout source and configuration
-        uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Load upstream configuration
-        if: github.repository_owner == 'Guovin'
-        run: |
-          git fetch --depth=1 origin gd
-          git archive FETCH_HEAD config | tar -x
-
-      - name: Record checked-out revision and state key
-        id: source
-        env:
-          CONFIG_HASH: ${{ hashFiles('config/**/*.ini', 'config/**/*.txt', 'config/**/*.m3u') }}
-        run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "state_prefix=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-" >> "$GITHUB_OUTPUT"
-          echo "state_key=playlist-state-v1-${RUNNER_OS}-${CONFIG_HASH}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/iptv-config-before"
-          cp -a config/. "$RUNNER_TEMP/iptv-config-before/"
-
-      - name: Remove generated files from the checkout
-        run: rm -rf -- output release-assets
-
-      - name: Restore result history
-        id: restore-state
-        uses: actions/cache/restore@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          path: |
-            output/data/cache.gz
-            output/data/frozen.gz
-          key: ${{ steps.source.outputs.state_key }}
-          restore-keys: ${{ steps.source.outputs.state_prefix }}
-
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-          update-environment: true
+          python-version: "3.14"
           cache: pipenv
+
+      - name: Install Pipenv and dependencies
+        run: |
+          python -m pip install --upgrade pip pipenv
+          pipenv install --dev
 
       - name: Install FFmpeg
         run: |
@@ -73,117 +48,43 @@ jobs:
           command -v ffprobe
           ffprobe -version | head -n 1
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip pipenv
-          pipenv --python 3.14
-          pipenv install --deploy
-
-      - name: Generate playlist results
-        env:
-          IPTV_API_ARTIFACT_BASE_URL: https://github.com/${{ github.repository }}/releases/download/playlist-latest
+      - name: Generate playlist
         run: pipenv run dev
 
-      - name: Check generated result
+      - name: Check generated user result
         run: |
-          test -s output/result.m3u
-          test -s output/result.txt
-          echo "Generated files:"
-          ls -lh output/result.m3u output/result.txt
+          echo "Checking configured result files..."
 
-      - name: Prepare public release assets
-        id: assets
-        run: |
-          final_file="$(pipenv run python -c 'from utils.config import config; print(config.final_file)')"
-          pipenv run python scripts/publish_results.py             --final-file "$final_file"             --destination release-assets
-          echo "final_file=$final_file" >> "$GITHUB_OUTPUT"
+          test -s output/user_result.txt || {
+            echo "::error::output/user_result.txt was not generated or is empty."
+            echo "Files currently under output/:"
+            find output -maxdepth 4 -type f -printf '%p (%s bytes)\n' | sort || true
+            exit 1
+          }
 
-      - name: Report non-persistent configuration changes
-        run: |
-          if ! diff -qr "$RUNNER_TEMP/iptv-config-before" config >/dev/null; then
-            echo "::warning::The update changed files under config/. These changes are not committed by the workflow."
-            {
-              echo "### Configuration notice"
-              echo
-              echo "The update changed files under \`config/\`."
-              echo "The workflow intentionally does not commit configuration changes."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          test -s output/user_result.m3u || {
+            echo "::error::output/user_result.m3u was not generated or is empty."
+            echo "The configuration requires open_m3u_result = True."
+            echo "Files currently under output/:"
+            find output -maxdepth 4 -type f -printf '%p (%s bytes)\n' | sort || true
+            exit 1
+          }
 
-      - name: Publish rolling playlist release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: playlist-latest
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: |
-          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG"               --repo "$GITHUB_REPOSITORY"               --target "$SOURCE_SHA"               --title "Latest generated playlist"               --notes "Rolling, automatically generated IPTV results."               --prerelease
-          fi
+          echo "Generated result files:"
+          ls -lh output/user_result.txt output/user_result.m3u
 
-          mapfile -d '' local_assets < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
-          gh release upload "$RELEASE_TAG" "${local_assets[@]}"             --repo "$GITHUB_REPOSITORY"             --clobber
-
-          mapfile -t remote_assets < <(
-            gh release view "$RELEASE_TAG"               --repo "$GITHUB_REPOSITORY"               --json assets               --jq '.assets[].name'
-          )
-          for asset in "${remote_assets[@]}"; do
-            if [[ ! -f "release-assets/$asset" ]]; then
-              gh release delete-asset "$RELEASE_TAG" "$asset"                 --repo "$GITHUB_REPOSITORY"                 --yes
-            fi
-          done
-
-      - name: Check that Git history was not changed before result commit
-        env:
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-
-      - name: Commit generated result to Git
+      - name: Commit user_result files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # output/ is ignored by .gitignore, so force-add the generated files.
-          git add -f output/result.m3u output/result.txt
+          # output/ is ignored by .gitignore, so force-add these two files.
+          git add -f output/user_result.txt output/user_result.m3u
 
           if git diff --cached --quiet; then
-            echo "No changes to result.m3u/result.txt."
+            echo "No changes to user_result.txt/user_result.m3u."
             exit 0
           fi
 
           git commit -m "chore: update IPTV playlist"
           git push
-
-      - name: Detect reusable result state
-        id: result-state
-        run: |
-          if [[ -f output/data/cache.gz || -f output/data/frozen.gz ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Save result history
-        if: steps.result-state.outputs.available == 'true' && steps.restore-state.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            output/data/cache.gz
-            output/data/frozen.gz
-          key: ${{ steps.source.outputs.state_key }}
-
-      - name: Add subscription links to summary
-        env:
-          RELEASE_BASE: https://github.com/${{ github.repository }}/releases/download/playlist-latest
-        run: |
-          {
-            echo "### Published playlist"
-            echo
-            echo "- Git: \`output/result.m3u\`"
-            if [[ -f release-assets/result.m3u ]]; then
-              echo "- M3U Release: $RELEASE_BASE/result.m3u"
-            fi
-            echo "- TXT Release: $RELEASE_BASE/result.txt"
-            if [[ -f release-assets/epg.gz ]]; then
-              echo "- EPG Release: $RELEASE_BASE/epg.gz"
-            fi
-            echo
-            echo "Generated from \`${{ steps.assets.outputs.final_file }}\`."
-          } >> "$GITHUB_STEP_SUMMARY"
