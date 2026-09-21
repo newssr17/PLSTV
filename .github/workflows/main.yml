@@ -1,10 +1,8 @@
 name: Generate IPTV playlist
 
 on:
-  # GitHub Actions cron uses UTC. 18:00 UTC = 02:00 Asia/Shanghai on the next day.
-  # Runs every Tuesday and Friday at 02:00 Asia/Shanghai.
-  schedule:
-    - cron: "0 18 * * 1,4"
+schedule:
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 permissions:
