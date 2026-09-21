@@ -1,8 +1,9 @@
 name: Generate IPTV playlist
 
 on:
-schedule:
-    - cron: "0 18 * * *"
+  schedule:
+    - cron: "0 2 * * 2,5"
+      timezone: "Asia/Shanghai"
   workflow_dispatch:
 
 permissions:
@@ -19,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout source and configuration
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -58,7 +59,7 @@ jobs:
           restore-keys: ${{ steps.source.outputs.state_prefix }}
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
           update-environment: true
